@@ -1,0 +1,4 @@
+{
+  "Lib/test/test_asyncio/test_tasks.py::GenericTaskTests::test_future_subclass": true,
+  "Lib/test/test_asyncio/test_tasks.py::PyTask_CFuture_Tests::test_context_1": true
+}

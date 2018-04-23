@@ -24,12 +24,6 @@ def isolated_context(func):
 
 class ContextTest(unittest.TestCase):
     def test_context_var_new_1(self):
-        with self.assertRaisesRegex(TypeError, 'takes exactly 1'):
-            contextvars.ContextVar()
-
-        with self.assertRaisesRegex(TypeError, 'must be a str'):
-            contextvars.ContextVar(1)
-
         c = contextvars.ContextVar('a')
         self.assertNotEqual(hash(c), hash('a'))
 
@@ -71,12 +65,6 @@ class ContextTest(unittest.TestCase):
                 pass
 
     def test_context_new_1(self):
-        with self.assertRaisesRegex(TypeError, 'any arguments'):
-            contextvars.Context(1)
-        with self.assertRaisesRegex(TypeError, 'any arguments'):
-            contextvars.Context(1, a=1)
-        with self.assertRaisesRegex(TypeError, 'any arguments'):
-            contextvars.Context(a=1)
         contextvars.Context(**{})
 
     def test_context_typerrors_1(self):

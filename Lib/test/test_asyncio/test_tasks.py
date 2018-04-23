@@ -2172,11 +2172,13 @@ class BaseTaskTests:
 
         async def sub():
             await asyncio.sleep(0.01, loop=loop)
+            import pdb;pdb.set_trace()
             self.assertEqual(cvar.get(), 'nope')
             cvar.set('something else')
 
         async def main():
             self.assertEqual(cvar.get(), 'nope')
+            import pdb;pdb.set_trace()
             subtask = self.new_task(loop, sub())
             cvar.set('yes')
             self.assertEqual(cvar.get(), 'yes')
