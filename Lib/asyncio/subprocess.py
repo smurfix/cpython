@@ -86,7 +86,7 @@ class SubprocessStreamProtocol(streams.FlowControlMixin,
         if fd == 0:
             pipe = self.stdin
             if pipe is not None:
-                pipe.close()
+                pipe._sync_close()
             self.connection_lost(exc)
             if exc is None:
                 self._stdin_closed.set_result(None)
@@ -119,11 +119,12 @@ class SubprocessStreamProtocol(streams.FlowControlMixin,
             self._transport = None
 
     def _get_close_waiter(self, stream):
-        if stream is self.stdin:
+        # TODO this is increasingly ugly
+        if self.stdin and self.stdin._is(stream):
             return self._stdin_closed
-        elif stream is self.stdout:
+        if self.stdout and self.stdout._is(stream):
             return self._stdout_closed
-        elif stream is self.stderr:
+        if self.stderr and self.stderr._is(stream):
             return self._stderr_closed
 
 
@@ -165,11 +166,11 @@ class Process:
 
     async def _feed_stdin(self, input):
         debug = self._loop.get_debug()
-        self.stdin.write(input)
         if debug:
             logger.debug(
                 '%r communicate: feed stdin (%s bytes)', self, len(input))
         try:
+            await self.stdin.write(input)
             await self.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
             # communicate() ignores BrokenPipeError and ConnectionResetError
@@ -178,7 +179,11 @@ class Process:
 
         if debug:
             logger.debug('%r communicate: close stdin', self)
-        self.stdin.close()
+
+        try:
+            await self.stdin.close()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            pass
 
     async def _noop(self):
         return None

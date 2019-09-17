@@ -15,6 +15,7 @@ if hasattr(socket, 'AF_UNIX'):
                 'connect_unix',
                 'UnixStreamServer')
 
+from . import constants
 from . import coroutines
 from . import events
 from . import exceptions
@@ -98,7 +99,7 @@ async def _connect(host, port,
                   ssl_handshake_timeout,
                   happy_eyeballs_delay, interleave):
     loop = events.get_running_loop()
-    stream = Stream(mode=StreamMode.READWRITE,
+    stream = LegacyStream(mode=StreamMode.READWRITE,
                     limit=limit,
                     loop=loop,
                     _asyncio_internal=True)
@@ -131,7 +132,7 @@ def connect_read_pipe(pipe, *, limit=_DEFAULT_LIMIT):
 
 async def _connect_read_pipe(pipe, limit):
     loop = events.get_running_loop()
-    stream = Stream(mode=StreamMode.READ,
+    stream = LegacyStream(mode=StreamMode.READ,
                     limit=limit,
                     loop=loop,
                     _asyncio_internal=True)
@@ -159,7 +160,7 @@ def connect_write_pipe(pipe, *, limit=_DEFAULT_LIMIT):
 
 async def _connect_write_pipe(pipe, limit):
     loop = events.get_running_loop()
-    stream = Stream(mode=StreamMode.WRITE,
+    stream = LegacyStream(mode=StreamMode.WRITE,
                     limit=limit,
                     loop=loop,
                     _asyncio_internal=True)
@@ -480,7 +481,7 @@ if hasattr(socket, 'AF_UNIX'):
                            ssl_handshake_timeout):
         """Similar to `connect()` but works with UNIX Domain Sockets."""
         loop = events.get_running_loop()
-        stream = Stream(mode=StreamMode.READWRITE,
+        stream = LegacyStream(mode=StreamMode.READWRITE,
                         limit=limit,
                         loop=loop,
                         _asyncio_internal=True)
@@ -1208,7 +1209,7 @@ class _StreamProtocol(_BaseStreamProtocol):
             # connection_made was called
             context = {
                 'message': ('An open stream object is being garbage '
-                            'collected; call "stream.close()" explicitly.')
+                            'collected; call "await stream.close()" explicitly.')
             }
             if self._source_traceback:
                 context['source_traceback'] = self._source_traceback
@@ -1229,7 +1230,7 @@ class _StreamProtocol(_BaseStreamProtocol):
             context = {
                 'message': ('An open stream was garbage collected prior to '
                             'establishing network connection; '
-                            'call "stream.close()" explicitly.')
+                            'call "await stream.close()" explicitly.')
             }
             if self._source_traceback:
                 context['source_traceback'] = self._source_traceback
@@ -1241,7 +1242,7 @@ class _StreamProtocol(_BaseStreamProtocol):
         if stream is None:
             return
         stream._set_transport(transport)
-        stream._protocol = self
+        stream._set_protocol(self)
 
     def connection_lost(self, exc):
         super().connection_lost(exc)
@@ -1260,7 +1261,7 @@ class _ServerStreamProtocol(_BaseStreamProtocol):
 
     def connection_made(self, transport):
         super().connection_made(transport)
-        stream = Stream(mode=StreamMode.READWRITE,
+        stream = LegacyStream(mode=StreamMode.READWRITE,
                         transport=transport,
                         protocol=self,
                         limit=self._limit,
@@ -1293,15 +1294,102 @@ class _OptionalAwait:
     def __await__(self):
         return self._method().__await__()
 
+from abc import ABCMeta, abstractmethod
 
-class Stream:
-    """Wraps a Transport.
+# minimal classes, from Trio. Work in progress.
+class AsyncResource(metaclass=ABCMeta):
+    @abstractmethod
+    async def close(self):
+        """Close this resource, possibly blocking."""
+    async def __aenter__(self):
+        return self
 
-    This exposes write(), writelines(), [can_]write_eof(),
-    get_extra_info() and close().  It adds drain() which returns an
-    optional Future on which you can wait for flow control.  It also
-    adds a transport property which references the Transport
-    directly.
+    async def __aexit__(self, *args):
+        await self.close()
+
+    def _is(self, other):
+        return self is other
+
+class SendStream(AsyncResource):
+    @abstractmethod
+    async def write(self, data):
+        """Sends the given data through the stream, blocking if
+        necessary."""
+    def can_write_eof(self):
+        return False
+
+class ReceiveStream(AsyncResource):
+    @abstractmethod
+    async def read(self, max_bytes=None):
+        """Wait until there is data available on this stream, and then return
+        some of it."""
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        data = await self.receive_some()
+        if not data:
+            raise StopAsyncIteration
+        return data
+
+    # helper that almost every protocol-minded user needs
+    async def readexactly(self, n):
+        """Read exactly `n` bytes.
+
+        Raise an IncompleteReadError if EOF is reached before `n` bytes can be
+        read. The IncompleteReadError.partial attribute of the exception will
+        contain the partial read bytes.
+
+        If n is zero, return empty bytes object.
+        """
+        if n < 0:
+            raise ValueError('readexactly size can not be less than zero')
+
+        data = await self.read(n)
+        if not data:
+            exceptions.IncompleteReadError('', n)
+
+        # optimize a bit
+        so_far = len(data)
+        if so_far == n:
+            return data
+
+        buf = [data]
+        while so_far < n:
+            data = await self.read(n - so_far)
+            if not data:
+                incomplete = b''.join(buf)
+                raise exceptions.IncompleteReadError(incomplete, n)
+
+            buf.append(data)
+            so_far += len(data)
+
+        return ''.join(buf)
+
+class AbstractStream(SendStream, ReceiveStream):
+    pass
+
+class HalfCloseableStream(AbstractStream):
+    @abstractmethod
+    async def write_eof(self):
+        """Send an end-of-file indication on this stream, if possible."""
+
+    def can_write_eof(self):
+        return True
+
+#from trio._ssl import SSLStream as _Trio_SSLStream
+
+class _SSLStream(_Trio_SSLStream):
+    _handshake_timeout = None
+    def __init__(self, *a, ssl_handshake_timeout=None, **kw):
+        self._handshake_timeout = ssl_handshake_timeout
+        _Trio_SSLStream.__init__(self, *a, **kw)
+
+    # TODO add do_handshake that obeys this timeout
+
+
+class TransportStream(AbstractStream):
+    """Wraps a Transport in a Stream.
     """
 
     _source_traceback = None
@@ -1311,7 +1399,6 @@ class Stream:
                  protocol=None,
                  loop=None,
                  limit=_DEFAULT_LIMIT,
-                 is_server_side=False,
                  _asyncio_internal=False):
         if not _asyncio_internal:
             raise RuntimeError(f"{self.__class__} should be instantiated "
@@ -1319,19 +1406,19 @@ class Stream:
         self._mode = mode
         self._transport = transport
         self._protocol = protocol
-        self._is_server_side = is_server_side
-
-        # The line length limit is  a security feature;
-        # it also doubles as half the buffer limit.
 
         if limit <= 0:
             raise ValueError('Limit cannot be <= 0')
-
         self._limit = limit
+
         if loop is None:
-            self._loop = events.get_event_loop()
+            loop = events.get_event_loop()
         else:
-            self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=3)
+        self._loop = loop
+
         self._buffer = bytearray()
         self._eof = False    # Whether we're done.
         self._waiter = None  # A future used by _wait_for_data()
@@ -1339,10 +1426,6 @@ class Stream:
         self._paused = False
         self._complete_fut = self._loop.create_future()
         self._complete_fut.set_result(None)
-
-        if self._loop.get_debug():
-            self._source_traceback = format_helpers.extract_stack(
-                sys._getframe(1))
 
     def __repr__(self):
         info = [self.__class__.__name__]
@@ -1367,9 +1450,6 @@ class Stream:
     def mode(self):
         return self._mode
 
-    def is_server_side(self):
-        return self._is_server_side
-
     @property
     def transport(self):
         warnings.warn("Stream.transport attribute is deprecated "
@@ -1379,21 +1459,16 @@ class Stream:
                       stacklevel=2)
         return self._transport
 
-    def write(self, data):
+    async def write(self, data):
         _ensure_can_write(self._mode)
         self._transport.write(data)
-        return self._fast_drain()
-
-    def writelines(self, data):
-        _ensure_can_write(self._mode)
-        self._transport.writelines(data)
-        return self._fast_drain()
+        await self._fast_drain()
 
     def _fast_drain(self):
         # The helper tries to use fast-path to return already existing
         # complete future object if underlying transport is not paused
         # and actual waiting for writing resume is not needed
-        exc = self.exception()
+        exc = self._exception
         if exc is not None:
             fut = self._loop.create_future()
             fut.set_exception(exc)
@@ -1407,7 +1482,28 @@ class Stream:
                 # fast path, the stream is not paused
                 # no need to wait for resume signal
                 return self._complete_fut
-        return _OptionalAwait(self.drain)
+        return self.drain()
+
+    async def drain(self):
+        """Flush the write buffer.
+
+        The intended use was to write
+
+          w.write(data)
+          await w.drain()
+        
+        except that now "write" is async-only, thus this is
+        """
+        _ensure_can_write(self._mode)
+        exc = self._exception
+        if exc is not None:
+            raise exc
+        if self._transport.is_closing():
+            # Wait for protocol.connection_lost() call
+            # Raise connection closing error if any,
+            # ConnectionResetError otherwise
+            await tasks.sleep(0)
+        await self._protocol._drain_helper()
 
     def write_eof(self):
         _ensure_can_write(self._mode)
@@ -1418,9 +1514,15 @@ class Stream:
             return False
         return self._transport.can_write_eof()
 
-    def close(self):
+    async def close(self):
         self._transport.close()
-        return _OptionalAwait(self.wait_closed)
+        return await self.wait_closed()
+
+    def _sync_close(self):
+        self._transport.close()
+
+    async def wait_closed(self):
+        await self._protocol._get_close_waiter(self)
 
     def is_closing(self):
         return self._transport.is_closing()
@@ -1429,59 +1531,11 @@ class Stream:
         self._transport.abort()
         await self.wait_closed()
 
-    async def wait_closed(self):
-        await self._protocol._get_close_waiter(self)
-
     def get_extra_info(self, name, default=None):
         return self._transport.get_extra_info(name, default)
 
-    async def drain(self):
-        """Flush the write buffer.
-
-        The intended use is to write
-
-          w.write(data)
-          await w.drain()
-        """
-        _ensure_can_write(self._mode)
-        exc = self.exception()
-        if exc is not None:
-            raise exc
-        if self._transport.is_closing():
-            # Wait for protocol.connection_lost() call
-            # Raise connection closing error if any,
-            # ConnectionResetError otherwise
-            await tasks.sleep(0)
-        await self._protocol._drain_helper()
-
-    async def sendfile(self, file, offset=0, count=None, *, fallback=True):
-        await self.drain()  # check for stream mode and exceptions
-        return await self._loop.sendfile(self._transport, file,
-                                         offset, count, fallback=fallback)
-
-    async def start_tls(self, sslcontext, *,
-                        server_hostname=None,
-                        ssl_handshake_timeout=None):
-        await self.drain()  # check for stream mode and exceptions
-        transport = await self._loop.start_tls(
-            self._transport, self._protocol, sslcontext,
-            server_side=self._is_server_side,
-            server_hostname=server_hostname,
-            ssl_handshake_timeout=ssl_handshake_timeout)
-        self._transport = transport
-        self._protocol._transport = transport
-        self._protocol._over_ssl = True
-
     def exception(self):
         return self._exception
-
-    def set_exception(self, exc):
-        warnings.warn("Stream.set_exception() is deprecated "
-                      "since Python 3.8 and is scheduled for removal in 3.10; "
-                      "it is an internal API",
-                      DeprecationWarning,
-                      stacklevel=2)
-        self._set_exception(exc)
 
     def _set_exception(self, exc):
         self._exception = exc
@@ -1500,32 +1554,22 @@ class Stream:
             if not waiter.cancelled():
                 waiter.set_result(None)
 
-    def set_transport(self, transport):
-        warnings.warn("Stream.set_transport() is deprecated "
-                      "since Python 3.8 and is scheduled for removal in 3.10; "
-                      "it is an internal API",
-                      DeprecationWarning,
-                      stacklevel=2)
-        self._set_transport(transport)
-
     def _set_transport(self, transport):
         if transport is self._transport:
             return
         assert self._transport is None, 'Transport already set'
         self._transport = transport
 
+    def _set_protocol(self, protocol):
+        if protocol is self._protocol:
+            return
+        assert self._protocol is None, 'Protocol already set'
+        self._protocol = protocol
+
     def _maybe_resume_transport(self):
         if self._paused and len(self._buffer) <= self._limit:
             self._paused = False
             self._transport.resume_reading()
-
-    def feed_eof(self):
-        warnings.warn("Stream.feed_eof() is deprecated "
-                      "since Python 3.8 and is scheduled for removal in 3.10; "
-                      "it is an internal API",
-                      DeprecationWarning,
-                      stacklevel=2)
-        self._feed_eof()
 
     def _feed_eof(self):
         self._eof = True
@@ -1534,14 +1578,6 @@ class Stream:
     def at_eof(self):
         """Return True if the buffer is empty and 'feed_eof' was called."""
         return self._eof and not self._buffer
-
-    def feed_data(self, data):
-        warnings.warn("Stream.feed_data() is deprecated "
-                      "since Python 3.8 and is scheduled for removal in 3.10; "
-                      "it is an internal API",
-                      DeprecationWarning,
-                      stacklevel=2)
-        self._feed_data(data)
 
     def _feed_data(self, data):
         _ensure_can_read(self._mode)
@@ -1594,6 +1630,495 @@ class Stream:
         finally:
             self._waiter = None
 
+    async def read(self, n=4096):
+        """Read up to `n` bytes from the stream.
+
+        This function try to read `n` bytes, and may return
+        less or equal bytes than requested, but at least one byte. If EOF was
+        received before any byte is read, this function returns empty byte
+        object.
+
+        Returned value is not limited with limit, configured at stream
+        creation.
+
+        If stream was paused, this function will automatically resume it if
+        needed.
+        """
+        _ensure_can_read(self._mode)
+
+        if self._exception is not None:
+            raise self._exception
+
+        if n == 0:
+            return b''
+
+        if not self._buffer and not self._eof:
+            await self._wait_for_data('read')
+
+        # This will work right even if buffer is less than n bytes
+        data = bytes(self._buffer[:n])
+        del self._buffer[:n]
+
+        self._maybe_resume_transport()
+        return data
+
+    def __aiter__(self):
+        _ensure_can_read(self._mode)
+        return self
+
+    async def __anext__(self):
+        val = await self.read()
+        if not val:
+            raise StopAsyncIteration
+        return val
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+
+class AbstractStreamModifier(AbstractStream):
+    """Interpose on top of a stream.
+
+    Use this class as a base for writing your own stream modifiers.
+    """
+
+    def __init__(self, *, lower_stream=None):
+        self._lower_stream = lower_stream
+
+    # AsyncResource
+
+    async def __aenter__(self):
+        return await self._lower_stream.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await self._lower_stream.__aexit__(exc_type, exc_val, exc_tb)
+
+    async def close(self):
+        await self._lower_stream.close()
+
+    async def wait_closed(self):
+        await self._lower_stream.wait_closed()
+
+    # SendStream
+
+    async def write(self, data):
+        await self._lower_stream.write(data)
+
+    # no-op, more or less
+    async def drain(self):
+        await self._lower_stream.drain()
+
+#   async def wait_write_all_might_not_block(self):
+#       await self._lower_stream.wait_write_all_might_not_block()
+
+    # ReceiveStream
+
+    async def read(self, max_bytes=None):
+        return await self._lower_stream.read(max_bytes)
+
+    # HalfCloseableStream
+
+    async def write_eof(self):
+        await self._lower_stream.write_eof()
+
+    def can_write_eof(self):
+        return self._lower_stream.can_write_eof()
+
+    # asyncio-specific methods. All of these are or should be deprecated
+    # because, in this design they are not necessary.
+
+    def _sync_close(self):
+        return self._lower_stream._sync_close()
+
+    def exception(self):
+        return self._lower_stream.exception()
+
+    def write_eof(self):
+        return self._lower_stream.write_eof()
+
+    def at_eof(self):
+        return self._lower_stream.at_eof()
+
+    def is_closing(self):
+        return self._lower_stream.is_closing()
+
+    def _set_exception(self, exc):
+        return self._lower_stream._set_exception(exc)
+
+    def _set_transport(self, transport):
+        return self._lower_stream._set_transport(transport)
+
+    def _set_protocol(self, protocol):
+        return self._lower_stream._set_protocol(protocol)
+
+    @property
+    def transport(self):
+        return self._lower_stream.transport
+
+    @property
+    def mode(self):
+        return self._lower_stream.mode
+
+    @property
+    def _loop(self):
+        return self._lower_stream._loop
+
+    @property
+    def _buffer(self):
+        return self._lower_stream._buffer
+
+    @property
+    def _waiter(self):
+        return self._lower_stream._waiter
+
+    @property
+    def _source_traceback(self):
+        return self._lower_stream._source_traceback
+
+    def get_extra_info(self, name, default=None):
+        return self._lower_stream.get_extra_info(name, default=default)
+
+    def _is(self, other):
+        if self is other:
+            return True
+        return self._lower_stream._is(other)
+
+    # for testing
+    def _feed_data(self, data):
+        return self._lower_stream._feed_data(data)
+
+    def _feed_eof(self):
+        return self._lower_stream._feed_eof()
+
+    def __aiter__(self):
+        self._iter = self._lower_stream.__aiter__()
+        return self
+
+    async def __anext__(self):
+        return await self._iter.__anext__()
+
+
+class _TrioWrap(AbstractStreamModifier):
+    """a shallow wrapper to translate trio names to asyncio"""
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    async def send_all(self,data):
+        try:
+            await self._wrapped.write(data)
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+    async def receive_some(self,n=4096):
+        try:
+            return await self._wrapped.read(n)
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+    async def aclose(self):
+        try:
+            await self._wrapped.close()
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+class _TrioUnwrap:
+    """A mixin to translate asyncio calls to trio names"""
+    async def write(self, data):
+        try:
+            await self.send_all(data)
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+    async def read(self, n):
+        try:
+            return await self.receive_some(n)
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+    async def close(self):
+        try:
+            await self.aclose()
+        except BaseException:
+            import pdb;pdb.set_trace()
+            raise
+
+
+class SSLStream(AbstractStreamModifier, _TrioUnwrap, _SSLStream):
+    """Packages a Trio SSLStream"""
+
+    def __init__(self, transport_stream, ssl_context, **kw):
+        super().__init__(lower_stream=transport_stream)
+        _SSLStream.__init__(self, _TrioWrap(transport_stream), ssl_context, **kw)
+
+    def get_extra_info(self, name, default=None):
+        if name == "sslcontext":
+            return self.context
+        return self._lower_stream.get_extra_info(name, default=default)
+
+
+class BufferedWriter(AbstractStreamModifier):
+    """A stream modifier that buffers written data.
+
+    TODO: optionally add a task that writes in the background.
+    """
+    def __init__(self, wraps, write_limit=_DEFAULT_LIMIT//2):
+        super().__init__(lower_stream=lower_stream)
+        self._write_limit = read_limit
+        self._send_buffer = bytearray()
+
+    def __repr__(self):
+        info = [self.__class__.__name__]
+        info.append(f'wraps={self._lower_stream}')
+        if self._limit != _DEFAULT_LIMIT:
+            info.append(f'limit={self._limit}')
+        return '<{}>'.format(' '.join(info))
+
+    async def write(self, data):
+        """
+        Accumulate written data.
+        """
+        self._send_buffer.extend(data)
+        if len(self._send_buffer) >= self._write_limit:
+            await self.drain()
+
+    async def drain(self):
+        """
+        Flush the data in this buffer.
+        """
+        buf = bytes(self._send_buffer)
+        if not buf:
+            return
+        self._send_buffer.clear()
+        try:
+            await self.write_all(buf)
+        except BaseException:
+            # We have no idea how much has been written,
+            # so the buffer is to be considered broken.
+            self._send_buffer = None
+            raise
+
+
+class BufferedReader(AbstractStreamModifier):
+    """A stream modifier that buffers read data.
+    """
+    def __init__(self, lower_stream, read_limit=_DEFAULT_LIMIT//2, write_limit=0):
+        super().__init__(lower_stream=lower_stream)
+        self._read_limit = read_limit
+        self._read_buffer = bytearray()
+
+        if read_limit <= 0:
+            raise ValueError('Limit cannot be <= 0')
+
+    @property
+    def read_buffer(self):
+        return self._read_buffer
+
+    @property
+    def _buffer(self):
+        return self._read_buffer
+
+    def __repr__(self):
+        info = [self.__class__.__name__]
+        info.append(f'wraps={self._lower_stream}')
+        if self._read_limit != _DEFAULT_LIMIT:
+            info.append(f'limit={self._read_limit}')
+        return '<{}>'.format(' '.join(info))
+
+    async def read(self, n=None):
+        """Get at most n bytes from the buffer.
+
+        If the buffer is empty, fill it.
+        """
+        buf = self._read_buffer
+        if not buf:
+            data = await self._lower_stream.read(n or self._read_limit)
+            if not data:
+                return data
+            if n is None or len(data) <= n:
+                return data
+            buf[:] = data[n:]
+            data = data[:n]
+        elif n is None or len(buf) == n:
+            data = bytes(buf)
+            buf.clear()
+        else:
+            data = bytes(buf[:n])
+            del buf[:n]
+        return data
+
+    async def extend_buffer(self):
+        """Extends the buffer with more data.
+        
+        This method returns the number of new bytes.
+        If zero, EOF has been seen.
+        """
+        data = await self._lower_stream.read()
+        if not data:
+            return False
+        self._read_buffer.extend(data)
+        return len(data)
+
+
+class LegacyStream(AbstractStreamModifier):
+    """Front-end for exposing a Stream to legacy code.
+
+    This exposes write(), writelines(), [can_]write_eof(),
+    get_extra_info() and close().
+    
+    Accessing the underlying transport and its attributes is deprecated and
+    scheduled for removal in 3.10.
+
+    aclose() is named close() here.
+    send_all/send_eof() is named write/write_eof() here.
+    receive_some() is named read() here.
+
+    """
+
+    def __init__(self, mode, *,
+                 transport=None,
+                 protocol=None,
+                 loop=None,
+                 limit=_DEFAULT_LIMIT,
+                 is_server_side=False,
+                 _asyncio_internal=False):
+
+        super().__init__(lower_stream=TransportStream(mode,
+                 transport=transport,
+                 protocol=protocol,
+                 loop=loop,
+                 limit=limit,
+                 _asyncio_internal=_asyncio_internal))
+
+        self._is_server_side = is_server_side
+
+        # The line length limit is  a security feature;
+        # it also doubles as half the buffer limit.
+
+        self._limit = limit
+        self._buffered = False
+
+    def __repr__(self):
+        info = [self.__class__.__name__]
+        info.append(f'wraps={self._lower_stream}')
+        if self._limit != _DEFAULT_LIMIT:
+            info.append(f'limit={self._limit}')
+        return '<{}>'.format(' '.join(info))
+
+    @property
+    def read_buffer(self):
+        if not self._buffered:
+            self._lower_stream = BufferedReader(self._lower_stream, self._limit)
+        self._buffered = True
+        return self._lower_stream.read_buffer
+
+    def is_server_side(self):
+        return self._is_server_side
+
+    @property
+    def transport(self):
+        warnings.warn("Stream.transport attribute is deprecated "
+                      "since Python 3.8 and is scheduled for removal in 3.10; "
+                      "it is an internal API",
+                      DeprecationWarning,
+                      stacklevel=2)
+        return super().transport
+
+    async def writelines(self, data):
+        for line in data:
+            await self.write(line)
+
+    async def abort(self):
+        # TODO call close with a zero timeout
+        await self.close()
+        await self.wait_closed()
+
+    async def sendfile(self, file, offset=0, count=None, *, fallback=True):
+        await self.drain()  # check for stream mode and exceptions
+        # TODO if possible. For now, fall back.
+        if not fallback:
+            raise exceptions.SendfileNotAvailableError
+
+        if offset:
+            file.seek(offset)
+
+        blocksize = (
+            min(count, constants.SENDFILE_FALLBACK_READBUFFER_SIZE)
+            if count else constants.SENDFILE_FALLBACK_READBUFFER_SIZE
+        )
+        buf = bytearray(blocksize)
+        total_sent = 0
+        try:
+            while True:
+                if count:
+                    blocksize = min(count - total_sent, blocksize)
+                    if blocksize <= 0:
+                        break
+                view = memoryview(buf)[:blocksize]
+                read = await self._loop.run_in_executor(None, file.readinto, view)
+                if not read:
+                    break  # EOF
+                await self.write(view[:read])
+                total_sent += read
+            return total_sent
+        finally:
+            if total_sent > 0 and hasattr(file, 'seek'):
+                file.seek(offset + total_sent)
+
+        return await self._loop.sendfile(self._transport, file,
+                                         offset, count, fallback=fallback)
+
+    def feed_data(self, data):
+        warnings.warn("Stream.feed_data() is deprecated "
+                      "since Python 3.8 and is scheduled for removal in 3.10; "
+                      "it is an internal API",
+                      DeprecationWarning,
+                      stacklevel=2)
+        self._feed_data(data)
+
+    def feed_eof(self):
+        warnings.warn("Stream.feed_eof() is deprecated "
+                      "since Python 3.8 and is scheduled for removal in 3.10; "
+                      "it is an internal API",
+                      DeprecationWarning,
+                      stacklevel=2)
+        self._feed_eof()
+
+    async def start_tls(self, sslcontext, *,
+                        server_hostname=None,
+                        ssl_handshake_timeout=None):
+        # TODO: check for exceptions?
+
+        self._lower_stream = SSLStream(self._lower_stream,
+            ssl_context=sslcontext,
+            server_side=self._is_server_side,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout)
+        self._buffered = False
+
+    def set_exception(self, exc):
+        warnings.warn("Stream.set_exception() is deprecated "
+                      "since Python 3.8 and is scheduled for removal in 3.10; "
+                      "it is an internal API",
+                      DeprecationWarning,
+                      stacklevel=2)
+        self._set_exception(exc)
+
+    def set_transport(self, transport):
+        warnings.warn("Stream.set_transport() is deprecated "
+                      "since Python 3.8 and is scheduled for removal in 3.10; "
+                      "it is an internal API",
+                      DeprecationWarning,
+                      stacklevel=2)
+        self._set_transport(transport)
+
     async def readline(self):
         """Read chunk of data from the stream until newline (b'\n') is found.
 
@@ -1606,23 +2131,20 @@ class Stream:
         newline was found, complete line including newline will be removed
         from internal buffer. Else, internal buffer will be cleared. Limit is
         compared against part of the line without newline.
-
-        If stream was paused, this function will automatically resume it if
-        needed.
         """
-        _ensure_can_read(self._mode)
+        _ensure_can_read(self.mode)
         sep = b'\n'
         seplen = len(sep)
+        buf = self.read_buffer
         try:
             line = await self.readuntil(sep)
         except exceptions.IncompleteReadError as e:
             return e.partial
         except exceptions.LimitOverrunError as e:
-            if self._buffer.startswith(sep, e.consumed):
-                del self._buffer[:e.consumed + seplen]
+            if buf.startswith(sep, e.consumed):
+                del buf[:e.consumed + seplen]
             else:
-                self._buffer.clear()
-            self._maybe_resume_transport()
+                buf.clear()
             raise ValueError(e.args[0])
         return line
 
@@ -1646,13 +2168,14 @@ class Stream:
         LimitOverrunError exception  will be raised, and the data
         will be left in the internal buffer, so it can be read again.
         """
-        _ensure_can_read(self._mode)
+        buf = self.read_buffer
         seplen = len(separator)
         if seplen == 0:
             raise ValueError('Separator should be at least one-byte string')
 
-        if self._exception is not None:
-            raise self._exception
+        exc = self.exception()
+        if exc is not None:
+            raise exc
 
         # Consume whole buffer except last bytes, which length is
         # one less than seplen. Let's check corner cases with
@@ -1677,13 +2200,15 @@ class Stream:
 
         # Loop until we find `separator` in the buffer, exceed the buffer size,
         # or an EOF has happened.
+        eof = self.at_eof()
+
         while True:
-            buflen = len(self._buffer)
+            buflen = len(buf)
 
             # Check if we now have enough data in the buffer for `separator` to
             # fit.
             if buflen - offset >= seplen:
-                isep = self._buffer.find(separator, offset)
+                isep = buf.find(separator, offset)
 
                 if isep != -1:
                     # `separator` is in the buffer. `isep` will be used later
@@ -1701,21 +2226,20 @@ class Stream:
             # even when EOF flag is set. This may happen when the last chunk
             # adds data which makes separator be found. That's why we check for
             # EOF *ater* inspecting the buffer.
-            if self._eof:
-                chunk = bytes(self._buffer)
-                self._buffer.clear()
+            if eof:
+                chunk = bytes(buf)
+                buf.clear()
                 raise exceptions.IncompleteReadError(chunk, None)
 
             # _wait_for_data() will resume reading if stream was paused.
-            await self._wait_for_data('readuntil')
+            eof = not await self._lower_stream.extend_buffer()
 
         if isep > self._limit:
             raise exceptions.LimitOverrunError(
                 'Separator is found, but chunk is longer than limit', isep)
 
-        chunk = self._buffer[:isep + seplen]
-        del self._buffer[:isep + seplen]
-        self._maybe_resume_transport()
+        chunk = buf[:isep + seplen]
+        del buf[:isep + seplen]
         return bytes(chunk)
 
     async def read(self, n=-1):
@@ -1738,81 +2262,28 @@ class Stream:
         If stream was paused, this function will automatically resume it if
         needed.
         """
-        _ensure_can_read(self._mode)
+        _ensure_can_read(self.mode)
 
-        if self._exception is not None:
-            raise self._exception
-
-        if n == 0:
-            return b''
-
-        if n < 0:
-            # This used to just loop creating a new waiter hoping to
-            # collect everything in self._buffer, but that would
-            # deadlock if the subprocess sends more than self.limit
-            # bytes.  So just call self.read(self._limit) until EOF.
-            blocks = []
-            while True:
-                block = await self.read(self._limit)
-                if not block:
-                    break
-                blocks.append(block)
-            return b''.join(blocks)
-
-        if not self._buffer and not self._eof:
-            await self._wait_for_data('read')
-
-        # This will work right even if buffer is less than n bytes
-        data = bytes(self._buffer[:n])
-        del self._buffer[:n]
-
-        self._maybe_resume_transport()
-        return data
-
-    async def readexactly(self, n):
-        """Read exactly `n` bytes.
-
-        Raise an IncompleteReadError if EOF is reached before `n` bytes can be
-        read. The IncompleteReadError.partial attribute of the exception will
-        contain the partial read bytes.
-
-        if n is zero, return empty bytes object.
-
-        Returned value is not limited with limit, configured at stream
-        creation.
-
-        If stream was paused, this function will automatically resume it if
-        needed.
-        """
-        _ensure_can_read(self._mode)
-        if n < 0:
-            raise ValueError('readexactly size can not be less than zero')
-
-        if self._exception is not None:
-            raise self._exception
+        exc = self.exception()
+        if exc is not None:
+            raise exc
 
         if n == 0:
             return b''
 
-        while len(self._buffer) < n:
-            if self._eof:
-                incomplete = bytes(self._buffer)
-                self._buffer.clear()
-                raise exceptions.IncompleteReadError(incomplete, n)
+        if n > 0:
+            return await self._lower_stream.read(n)
 
-            await self._wait_for_data('readexactly')
-
-        if len(self._buffer) == n:
-            data = bytes(self._buffer)
-            self._buffer.clear()
-        else:
-            data = bytes(self._buffer[:n])
-            del self._buffer[:n]
-        self._maybe_resume_transport()
-        return data
+        # Just call self.read(self._limit) until EOF.
+        blocks = []
+        while True:
+            block = await self._lower_stream.read(self._limit)
+            if not block:
+                break
+            blocks.append(block)
+        return b''.join(blocks)
 
     def __aiter__(self):
-        _ensure_can_read(self._mode)
         return self
 
     async def __anext__(self):
@@ -1826,3 +2297,5 @@ class Stream:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+Stream = LegacyStream

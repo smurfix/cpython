@@ -115,9 +115,9 @@ class SubprocessMixin:
             )
 
             # feed data
-            proc.stdin.write(data)
+            await proc.stdin.write(data)
             await proc.stdin.drain()
-            proc.stdin.close()
+            await proc.stdin.close()
 
             # get output and exitcode
             data = await proc.stdout.read()
@@ -241,7 +241,7 @@ class SubprocessMixin:
 
         async def write_stdin(proc, data):
             await asyncio.sleep(0.5)
-            proc.stdin.write(data)
+            await proc.stdin.write(data)
             await proc.stdin.drain()
 
         coro = write_stdin(proc, large_data)
