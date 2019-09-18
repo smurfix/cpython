@@ -1609,16 +1609,14 @@ class AbstractStreamModifier(abc.HalfCloseableStream):
     # AsyncResource
 
     async def __aenter__(self):
-        return await self._lower_stream.__aenter__()
+        await self._lower_stream.__aenter__()
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return await self._lower_stream.__aexit__(exc_type, exc_val, exc_tb)
 
     async def close(self):
         await self._lower_stream.close()
-
-    async def wait_closed(self):
-        await self._lower_stream.wait_closed()
 
     # SendStream
 
@@ -1646,10 +1644,13 @@ class AbstractStreamModifier(abc.HalfCloseableStream):
         return self._lower_stream.can_write_eof()
 
     # asyncio-specific methods. All of these are or should be deprecated
-    # because, in this design they are not necessary.
+    # because they are no longer necessary.
 
     def _sync_close(self):
         return self._lower_stream._sync_close()
+
+    async def wait_closed(self):
+        await self._lower_stream.wait_closed()
 
     def exception(self):
         return self._lower_stream.exception()
@@ -1884,6 +1885,128 @@ class BufferedReader(AbstractStreamModifier):
         self._read_buffer.extend(data)
         return len(data)
 
+    async def readline(self):
+        """Read chunk of data from the stream until newline (b'\n') is found.
+
+        On success, return chunk that ends with newline. If only partial
+        line can be read due to EOF, return incomplete line without
+        terminating newline. When EOF was reached while no bytes read, empty
+        bytes object is returned.
+
+        If limit is reached, ValueError will be raised. In that case, if
+        newline was found, complete line including newline will be removed
+        from internal buffer. Else, internal buffer will be cleared. Limit is
+        compared against part of the line without newline.
+        """
+        sep = b'\n'
+        seplen = len(sep)
+        buf = self.read_buffer
+        try:
+            line = await self.readuntil(sep)
+        except exceptions.IncompleteReadError as e:
+            return e.partial
+        except exceptions.LimitOverrunError as e:
+            if buf.startswith(sep, e.consumed):
+                del buf[:e.consumed + seplen]
+            else:
+                buf.clear()
+            raise ValueError(e.args[0])
+        return line
+
+    async def readuntil(self, separator=b'\n'):
+        """Read data from the stream until ``separator`` is found.
+
+        On success, the data and separator will be removed from the
+        internal buffer (consumed). Returned data will include the
+        separator at the end.
+
+        Configured stream limit is used to check result. Limit sets the
+        maximal length of data that can be returned, not counting the
+        separator.
+
+        If an EOF occurs and the complete separator is still not found,
+        an IncompleteReadError exception will be raised, and the internal
+        buffer will be reset.  The IncompleteReadError.partial attribute
+        may contain the separator partially.
+
+        If the data cannot be read because of over limit, a
+        LimitOverrunError exception  will be raised, and the data
+        will be left in the internal buffer, so it can be read again.
+        """
+        buf = self.read_buffer
+        seplen = len(separator)
+        if seplen == 0:
+            raise ValueError('Separator should be at least one-byte string')
+
+        exc = self.exception()
+        if exc is not None:
+            raise exc
+
+        # Consume whole buffer except last bytes, which length is
+        # one less than seplen. Let's check corner cases with
+        # separator='SEPARATOR':
+        # * we have received almost complete separator (without last
+        #   byte). i.e buffer='some textSEPARATO'. In this case we
+        #   can safely consume len(separator) - 1 bytes.
+        # * last byte of buffer is first byte of separator, i.e.
+        #   buffer='abcdefghijklmnopqrS'. We may safely consume
+        #   everything except that last byte, but this require to
+        #   analyze bytes of buffer that match partial separator.
+        #   This is slow and/or require FSM. For this case our
+        #   implementation is not optimal, since require rescanning
+        #   of data that is known to not belong to separator. In
+        #   real world, separator will not be so long to notice
+        #   performance problems. Even when reading MIME-encoded
+        #   messages :)
+
+        # `offset` is the number of bytes from the beginning of the buffer
+        # where there is no occurrence of `separator`.
+        offset = 0
+
+        # Loop until we find `separator` in the buffer, exceed the buffer size,
+        # or an EOF has happened.
+        eof = self.at_eof()
+
+        while True:
+            buflen = len(buf)
+
+            # Check if we now have enough data in the buffer for `separator` to
+            # fit.
+            if buflen - offset >= seplen:
+                isep = buf.find(separator, offset)
+
+                if isep != -1:
+                    # `separator` is in the buffer. `isep` will be used later
+                    # to retrieve the data.
+                    break
+
+                # see upper comment for explanation.
+                offset = buflen + 1 - seplen
+                if offset > self._read_limit:
+                    raise exceptions.LimitOverrunError(
+                        'Separator is not found, and chunk exceed the limit',
+                        offset)
+
+            # Complete message (with full separator) may be present in buffer
+            # even when EOF flag is set. This may happen when the last chunk
+            # adds data which makes separator be found. That's why we check for
+            # EOF *ater* inspecting the buffer.
+            if eof:
+                chunk = bytes(buf)
+                buf.clear()
+                raise exceptions.IncompleteReadError(chunk, None)
+
+            # _wait_for_data() will resume reading if stream was paused.
+            eof = not await self.extend_buffer()
+
+        if isep > self._read_limit:
+            raise exceptions.LimitOverrunError(
+                'Separator is found, but chunk is longer than limit', isep)
+
+        chunk = buf[:isep + seplen]
+        del buf[:isep + seplen]
+        return bytes(chunk)
+
 
 class LegacyStream(AbstractStreamModifier):
     """Front-end for exposing a Stream to legacy code.
@@ -1931,11 +2054,11 @@ class LegacyStream(AbstractStreamModifier):
         return '<{}>'.format(' '.join(info))
 
     @property
-    def read_buffer(self):
+    def read_buffered(self):
         if not self._buffered:
             self._lower_stream = BufferedReader(self._lower_stream, self._limit)
         self._buffered = True
-        return self._lower_stream.read_buffer
+        return self._lower_stream
 
     def is_server_side(self):
         return self._is_server_side
@@ -2052,21 +2175,7 @@ class LegacyStream(AbstractStreamModifier):
         from internal buffer. Else, internal buffer will be cleared. Limit is
         compared against part of the line without newline.
         """
-        _ensure_can_read(self.mode)
-        sep = b'\n'
-        seplen = len(sep)
-        buf = self.read_buffer
-        try:
-            line = await self.readuntil(sep)
-        except exceptions.IncompleteReadError as e:
-            return e.partial
-        except exceptions.LimitOverrunError as e:
-            if buf.startswith(sep, e.consumed):
-                del buf[:e.consumed + seplen]
-            else:
-                buf.clear()
-            raise ValueError(e.args[0])
-        return line
+        return await self.read_buffered.readline()
 
     async def readuntil(self, separator=b'\n'):
         """Read data from the stream until ``separator`` is found.
@@ -2088,79 +2197,7 @@ class LegacyStream(AbstractStreamModifier):
         LimitOverrunError exception  will be raised, and the data
         will be left in the internal buffer, so it can be read again.
         """
-        buf = self.read_buffer
-        seplen = len(separator)
-        if seplen == 0:
-            raise ValueError('Separator should be at least one-byte string')
-
-        exc = self.exception()
-        if exc is not None:
-            raise exc
-
-        # Consume whole buffer except last bytes, which length is
-        # one less than seplen. Let's check corner cases with
-        # separator='SEPARATOR':
-        # * we have received almost complete separator (without last
-        #   byte). i.e buffer='some textSEPARATO'. In this case we
-        #   can safely consume len(separator) - 1 bytes.
-        # * last byte of buffer is first byte of separator, i.e.
-        #   buffer='abcdefghijklmnopqrS'. We may safely consume
-        #   everything except that last byte, but this require to
-        #   analyze bytes of buffer that match partial separator.
-        #   This is slow and/or require FSM. For this case our
-        #   implementation is not optimal, since require rescanning
-        #   of data that is known to not belong to separator. In
-        #   real world, separator will not be so long to notice
-        #   performance problems. Even when reading MIME-encoded
-        #   messages :)
-
-        # `offset` is the number of bytes from the beginning of the buffer
-        # where there is no occurrence of `separator`.
-        offset = 0
-
-        # Loop until we find `separator` in the buffer, exceed the buffer size,
-        # or an EOF has happened.
-        eof = self.at_eof()
-
-        while True:
-            buflen = len(buf)
-
-            # Check if we now have enough data in the buffer for `separator` to
-            # fit.
-            if buflen - offset >= seplen:
-                isep = buf.find(separator, offset)
-
-                if isep != -1:
-                    # `separator` is in the buffer. `isep` will be used later
-                    # to retrieve the data.
-                    break
-
-                # see upper comment for explanation.
-                offset = buflen + 1 - seplen
-                if offset > self._limit:
-                    raise exceptions.LimitOverrunError(
-                        'Separator is not found, and chunk exceed the limit',
-                        offset)
-
-            # Complete message (with full separator) may be present in buffer
-            # even when EOF flag is set. This may happen when the last chunk
-            # adds data which makes separator be found. That's why we check for
-            # EOF *ater* inspecting the buffer.
-            if eof:
-                chunk = bytes(buf)
-                buf.clear()
-                raise exceptions.IncompleteReadError(chunk, None)
-
-            # _wait_for_data() will resume reading if stream was paused.
-            eof = not await self._lower_stream.extend_buffer()
-
-        if isep > self._limit:
-            raise exceptions.LimitOverrunError(
-                'Separator is found, but chunk is longer than limit', isep)
-
-        chunk = buf[:isep + seplen]
-        del buf[:isep + seplen]
-        return bytes(chunk)
+        return await self.read_buffered.readuntil(separator)
 
     async def read(self, n=-1):
         """Read up to `n` bytes from the stream.
@@ -2194,7 +2231,7 @@ class LegacyStream(AbstractStreamModifier):
         if n > 0:
             return await self._lower_stream.read(n)
 
-        # Just call self.read(self._limit) until EOF.
+        # Just call self.read() until EOF.
         blocks = []
         while True:
             block = await self._lower_stream.read(self._limit)
@@ -2202,9 +2239,6 @@ class LegacyStream(AbstractStreamModifier):
                 break
             blocks.append(block)
         return b''.join(blocks)
-
-    def __aiter__(self):
-        return self
 
     async def __anext__(self):
         val = await self.readline()
@@ -2214,8 +2248,5 @@ class LegacyStream(AbstractStreamModifier):
 
     async def __aenter__(self):
         return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
 
 Stream = LegacyStream
